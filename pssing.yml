@@ -1,2 +1,2 @@
-username: snehald12
-token: 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
+username: snehald1241
+token: ${{ secrets.GITHUB_TOKEN }}
