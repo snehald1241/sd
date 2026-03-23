@@ -94,20 +94,19 @@
 
     - name: Build merge job list
       ansible.builtin.set_fact:
-        merge_jobs: "{{ merge_jobs | default([]) + job_list }}"
+        merge_jobs: "{{ merge_jobs | default([]) + jobs }}"
       vars:
-        primary: "{{ item[0] }}"
-        duplicates: "{{ item[1:] }}"
-        job_list: >-
+        jobs: >-
           {% set jobs = [] %}
+          {% set primary = item[0] %}
           {% for d in duplicates %}
             {% set assignments = query('ansible.platform.gateway_api', 'role_user_assignments',
-              query_params={'user_id': d.id},
+              query_params={'user_id': dup.id},
               host=aap_hostname, username=aap_username,
               password=aap_password, verify_ssl=aap_validate_certs) %}
             {% for a in assignments %}
               {% set rid = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
-              {% set _ = jobs.append({'primary_id': primary.id, 'dup_id': d.id, 'role_id': rid}) %}
+              {% set _ = jobs.append({'primary_id': primary.id, 'dup_id': dup.id, 'role_id': rid}) %}
             {% endfor %}
           {% endfor %}
           {{ jobs }}
