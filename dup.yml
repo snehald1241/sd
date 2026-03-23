@@ -70,10 +70,10 @@
       loop: "{{ user_report | default([]) }}"
 
     # =========================================================
-    # NEW TASKS: MERGE + DELETE DUPLICATES
+    # MERGE + DELETE FIXED
     # =========================================================
 
-    - name: Build duplicate groups (email → users list)
+    - name: Build duplicate groups
       ansible.builtin.set_fact:
         dupe_groups: "{{ dupe_groups | default([]) + [ item.value ] }}"
       loop: "{{ users_by_email | dict2items }}"
@@ -83,7 +83,7 @@
       ansible.builtin.set_fact:
         dupe_groups: "{{ dupe_groups | default([]) }}"
 
-    # ---- MERGE ROLES ----
+    # ---- MERGE ROLES (FIXED) ----
 
     - name: Merge roles from duplicates to primary user
       ansible.builtin.uri:
@@ -95,24 +95,21 @@
         validate_certs: "{{ aap_validate_certs }}"
         body_format: json
         body:
-          user: "{{ item.0[0].id }}"
-          role_definition: "{{ (item.2.role_definition.id if item.2.role_definition is mapping else item.2.role_definition) }}"
+          user: "{{ item.0.0.id }}"
+          role_definition: "{{ (role.role_definition.id if role.role_definition is mapping else role.role_definition) }}"
       vars:
-        dup_assignments: "{{ query('ansible.platform.gateway_api', 'role_user_assignments',
-          query_params={'user_id': item.1.id},
+        roles: "{{ query('ansible.platform.gateway_api', 'role_user_assignments',
+          query_params={'user_id': item.0.1.id},
           host=aap_hostname, username=aap_username,
           password=aap_password, verify_ssl=aap_validate_certs) }}"
-      loop: "{{ dupe_groups | subelements('1', skip_missing=True) }}"
+      loop: "{{ dupe_groups | subelements('1') | subelements('roles', skip_missing=True) }}"
       loop_control:
-        label: "{{ item.1.username }}"
-      when: item.1.id != item.0[0].id
-      with_subelements:
-        - "{{ dupe_groups }}"
-        - 1
+        label: "{{ item.0.1.username }}"
+      when: item.0.1.id != item.0.0.id
 
     # ---- DELETE DUPLICATES ----
 
-    - name: Delete duplicate users (excluding primary)
+    - name: Delete duplicate users
       ansible.builtin.uri:
         url: "{{ aap_hostname }}/api/gateway/v1/users/{{ item.1.id }}/"
         method: DELETE
@@ -121,5 +118,5 @@
         force_basic_auth: true
         validate_certs: "{{ aap_validate_certs }}"
         status_code: [204, 202]
-      loop: "{{ dupe_groups | subelements('1', skip_missing=True) }}"
-      when: item.1.id != item.0[0].id
+      loop: "{{ dupe_groups | subelements('1') }}"
+      when: item.1.id != item.0.0.id
