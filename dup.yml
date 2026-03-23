@@ -89,67 +89,96 @@
       loop: "{{ user_report | default([]) }}"
 
     # =========================================================
-    # FIXED MERGE + DELETE LOGIC (NO BLOCK LOOP)
+    # MERGE + DELETE LOGIC (FIXED)
     # =========================================================
 
     - name: Build primary user map (first user = primary)
       ansible.builtin.set_fact:
-        primary_map: "{{ primary_map | default({}) | combine({ item.value[0].email: item.value }) }}"
+        primary_map: "{{ primary_map | default({}) | combine({ item.key: item.value }) }}"
       loop: "{{ users_by_email | dict2items }}"
       when: item.value | length > 1
 
-    # ---- MERGE ROLES ----
+    # ---- GET PRIMARY USER ROLES (FIXED) ----
 
-    - name: Merge roles - get primary roles
+    - name: Merge roles - get primary roles (robust)
       ansible.builtin.set_fact:
-        primary_roles_map: "{{ primary_roles_map | default({}) | combine({
-          item.key:
-          query('ansible.platform.gateway_api', 'role_user_assignments',
+        primary_roles_map: "{{ primary_roles_map | default({}) | combine({ item.key: role_ids }) }}"
+      vars:
+        assignments: "{{ query('ansible.platform.gateway_api', 'role_user_assignments',
           query_params={'user_id': item.value[0].id},
           host=aap_hostname, username=aap_username,
-          password=aap_password, verify_ssl=aap_validate_certs)
-          | map(attribute='role_definition')
-          | map('extract', attribute='id', default=None)
-          | list
-        }) }}"
+          password=aap_password, verify_ssl=aap_validate_certs) }}"
+        role_ids: >-
+          {% set ids = [] %}
+          {% for a in assignments %}
+            {% set rid = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
+            {% if rid not in ids %}
+              {% set _ = ids.append(rid) %}
+            {% endif %}
+          {% endfor %}
+          {{ ids }}
       loop: "{{ primary_map | dict2items }}"
 
-    - name: Merge roles from duplicates into primary
-      ansible.builtin.uri:
-        url: "{{ aap_hostname }}/api/gateway/v1/role_user_assignments/"
-        method: POST
-        user: "{{ aap_username }}"
-        password: "{{ aap_password }}"
-        force_basic_auth: true
-        validate_certs: "{{ aap_validate_certs }}"
-        body_format: json
-        body:
-          user: "{{ item.0.value[0].id }}"
-          role_definition: "{{ (item.1.role_definition.id if item.1.role_definition is mapping else item.1.role_definition) }}"
-      loop: "{{ primary_map | dict2items | subelements('value[1:]', skip_missing=True) | subelements('1', skip_missing=True) }}"
-      when: >
-        (item.1.role_definition.id if item.1.role_definition is mapping else item.1.role_definition)
-        not in primary_roles_map[item.0.key]
+    # ---- MERGE ROLES ----
 
+    - name: Merge roles from duplicates into primary user
       vars:
-        dup_assignments: "{{ query('ansible.platform.gateway_api', 'role_user_assignments',
-          query_params={'user_id': item.1.id},
-          host=aap_hostname, username=aap_username,
-          password=aap_password, verify_ssl=aap_validate_certs) }}"
+        duplicate_users: "{{ item.value[1:] }}"
+      loop: "{{ primary_map | dict2items }}"
       loop_control:
-        label: "{{ item.0.key }}"
+        label: "{{ item.key }}"
+      block:
+
+        - name: Process each duplicate user
+          vars:
+            dup: "{{ dup_user }}"
+            assignments: "{{ query('ansible.platform.gateway_api', 'role_user_assignments',
+              query_params={'user_id': dup_user.id},
+              host=aap_hostname, username=aap_username,
+              password=aap_password, verify_ssl=aap_validate_certs) }}"
+          loop: "{{ duplicate_users }}"
+          loop_control:
+            loop_var: dup_user
+          block:
+
+            - name: Assign missing roles to primary
+              ansible.builtin.uri:
+                url: "{{ aap_hostname }}/api/gateway/v1/role_user_assignments/"
+                method: POST
+                user: "{{ aap_username }}"
+                password: "{{ aap_password }}"
+                force_basic_auth: true
+                validate_certs: "{{ aap_validate_certs }}"
+                body_format: json
+                body:
+                  user: "{{ item.value[0].id }}"
+                  role_definition: "{{ (role.role_definition.id if role.role_definition is mapping else role.role_definition) }}"
+              loop: "{{ assignments }}"
+              loop_control:
+                loop_var: role
+              when: >
+                (role.role_definition.id if role.role_definition is mapping else role.role_definition)
+                not in primary_roles_map[item.key]
 
     # ---- DELETE DUPLICATES ----
 
     - name: Delete duplicate users (excluding primary)
-      ansible.builtin.uri:
-        url: "{{ aap_hostname }}/api/gateway/v1/users/{{ item.1.id }}/"
-        method: DELETE
-        user: "{{ aap_username }}"
-        password: "{{ aap_password }}"
-        force_basic_auth: true
-        validate_certs: "{{ aap_validate_certs }}"
-        status_code: [204, 202]
-      loop: "{{ primary_map | dict2items | subelements('value[1:]', skip_missing=True) }}"
+      vars:
+        duplicate_users: "{{ item.value[1:] }}"
+      loop: "{{ primary_map | dict2items }}"
       loop_control:
-        label: "{{ item.1.username }}"
+        label: "{{ item.key }}"
+      block:
+
+        - name: Remove duplicate users
+          ansible.builtin.uri:
+            url: "{{ aap_hostname }}/api/gateway/v1/users/{{ dup_user.id }}/"
+            method: DELETE
+            user: "{{ aap_username }}"
+            password: "{{ aap_password }}"
+            force_basic_auth: true
+            validate_certs: "{{ aap_validate_certs }}"
+            status_code: [204, 202]
+          loop: "{{ duplicate_users }}"
+          loop_control:
+            loop_var: dup_user
