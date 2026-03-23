@@ -11,6 +11,11 @@
     aap_validate_certs: true
 
   tasks:
+
+    # ---------------------------------------------------------
+    # EXISTING LOGIC (UNCHANGED)
+    # ---------------------------------------------------------
+
     - name: Load all users
       ansible.builtin.set_fact:
         all_users: "{{ query('ansible.platform.gateway_api', 'users', return_all=True, return_objects=True, host=aap_hostname, username=aap_username, password=aap_password, verify_ssl=aap_validate_certs) }}"
@@ -70,7 +75,7 @@
       loop: "{{ user_report | default([]) }}"
 
     # =========================================================
-    # ✅ FIXED MERGE LOGIC (NO subelements misuse)
+    # ✅ NEW CLEAN MERGE + DELETE LOGIC
     # =========================================================
 
     - name: Build duplicate groups
@@ -83,34 +88,41 @@
       ansible.builtin.set_fact:
         dupe_groups: "{{ dupe_groups | default([]) }}"
 
-    # ---- MERGE ROLES ----
+    # ---------------------------------------------------------
+    # BUILD FLAT MERGE JOB LIST (KEY STEP)
+    # ---------------------------------------------------------
 
-    - name: Merge roles from duplicates to primary
-      ansible.builtin.uri:
-        url: "{{ aap_hostname }}/api/gateway/v1/role_user_assignments/"
-        method: POST
-        user: "{{ aap_username }}"
-        password: "{{ aap_password }}"
-        force_basic_auth: true
-        validate_certs: "{{ aap_validate_certs }}"
-        body_format: json
-        body:
-          user: "{{ item.0.id }}"
-          role_definition: "{{ role_id }}"
+    - name: Build merge job list
+      ansible.builtin.set_fact:
+        merge_jobs: "{{ merge_jobs | default([]) + job_list }}"
       vars:
         primary: "{{ item[0] }}"
         duplicates: "{{ item[1:] }}"
+        job_list: >-
+          {% set jobs = [] %}
+          {% for d in duplicates %}
+            {% set assignments = query('ansible.platform.gateway_api', 'role_user_assignments',
+              query_params={'user_id': d.id},
+              host=aap_hostname, username=aap_username,
+              password=aap_password, verify_ssl=aap_validate_certs) %}
+            {% for a in assignments %}
+              {% set rid = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
+              {% set _ = jobs.append({'primary_id': primary.id, 'dup_id': d.id, 'role_id': rid}) %}
+            {% endfor %}
+          {% endfor %}
+          {{ jobs }}
       loop: "{{ dupe_groups }}"
-      loop_control:
-        label: "{{ primary.email }}"
-      when: item | length > 1
-      register: merge_results
-      vars_prompt: []
-      # inner logic via loop_control is not possible → handled below
+      when: dupe_groups | length > 0
 
-    # ---- ASSIGN ROLES PER DUPLICATE ----
+    - name: Ensure merge_jobs exists
+      ansible.builtin.set_fact:
+        merge_jobs: "{{ merge_jobs | default([]) }}"
 
-    - name: Assign roles from each duplicate
+    # ---------------------------------------------------------
+    # MERGE ROLES (SIMPLE LOOP)
+    # ---------------------------------------------------------
+
+    - name: Assign roles to primary user
       ansible.builtin.uri:
         url: "{{ aap_hostname }}/api/gateway/v1/role_user_assignments/"
         method: POST
@@ -120,35 +132,23 @@
         validate_certs: "{{ aap_validate_certs }}"
         body_format: json
         body:
-          user: "{{ primary.id }}"
-          role_definition: "{{ (role.role_definition.id if role.role_definition is mapping else role.role_definition) }}"
-      vars:
-        primary: "{{ item.0 }}"
-        dup: "{{ item.1 }}"
-        assignments: "{{ query('ansible.platform.gateway_api', 'role_user_assignments',
-          query_params={'user_id': item.1.id},
-          host=aap_hostname, username=aap_username,
-          password=aap_password, verify_ssl=aap_validate_certs) }}"
-      loop: "{{ dupe_groups | map('list') | list | subelements('1') }}"
-      loop_control:
-        label: "{{ item.1.username }}"
-      when: item.1.id != item.0.id
-      loop_control:
-        extended: yes
-      with_items: "{{ assignments }}"
-      loop_control:
-        loop_var: role
+          user: "{{ item.primary_id }}"
+          role_definition: "{{ item.role_id }}"
+      loop: "{{ merge_jobs }}"
+      when: merge_jobs | length > 0
 
-    # ---- DELETE DUPLICATES ----
+    # ---------------------------------------------------------
+    # DELETE DUPLICATES
+    # ---------------------------------------------------------
 
     - name: Delete duplicate users
       ansible.builtin.uri:
-        url: "{{ aap_hostname }}/api/gateway/v1/users/{{ item.1.id }}/"
+        url: "{{ aap_hostname }}/api/gateway/v1/users/{{ item.dup_id }}/"
         method: DELETE
         user: "{{ aap_username }}"
         password: "{{ aap_password }}"
         force_basic_auth: true
         validate_certs: "{{ aap_validate_certs }}"
         status_code: [204, 202]
-      loop: "{{ dupe_groups | subelements('1') }}"
-      when: item.1.id != item.0.id
+      loop: "{{ merge_jobs | map(attribute='dup_id') | unique | list }}"
+      when: merge_jobs | length > 0
