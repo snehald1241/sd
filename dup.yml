@@ -70,7 +70,7 @@
       loop: "{{ user_report | default([]) }}"
 
     # =========================================================
-    # MERGE + DELETE FIXED
+    # ✅ FIXED MERGE LOGIC (NO subelements misuse)
     # =========================================================
 
     - name: Build duplicate groups
@@ -83,9 +83,9 @@
       ansible.builtin.set_fact:
         dupe_groups: "{{ dupe_groups | default([]) }}"
 
-    # ---- MERGE ROLES (FIXED) ----
+    # ---- MERGE ROLES ----
 
-    - name: Merge roles from duplicates to primary user
+    - name: Merge roles from duplicates to primary
       ansible.builtin.uri:
         url: "{{ aap_hostname }}/api/gateway/v1/role_user_assignments/"
         method: POST
@@ -95,17 +95,49 @@
         validate_certs: "{{ aap_validate_certs }}"
         body_format: json
         body:
-          user: "{{ item.0.0.id }}"
+          user: "{{ item.0.id }}"
+          role_definition: "{{ role_id }}"
+      vars:
+        primary: "{{ item[0] }}"
+        duplicates: "{{ item[1:] }}"
+      loop: "{{ dupe_groups }}"
+      loop_control:
+        label: "{{ primary.email }}"
+      when: item | length > 1
+      register: merge_results
+      vars_prompt: []
+      # inner logic via loop_control is not possible → handled below
+
+    # ---- ASSIGN ROLES PER DUPLICATE ----
+
+    - name: Assign roles from each duplicate
+      ansible.builtin.uri:
+        url: "{{ aap_hostname }}/api/gateway/v1/role_user_assignments/"
+        method: POST
+        user: "{{ aap_username }}"
+        password: "{{ aap_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ aap_validate_certs }}"
+        body_format: json
+        body:
+          user: "{{ primary.id }}"
           role_definition: "{{ (role.role_definition.id if role.role_definition is mapping else role.role_definition) }}"
       vars:
-        roles: "{{ query('ansible.platform.gateway_api', 'role_user_assignments',
-          query_params={'user_id': item.0.1.id},
+        primary: "{{ item.0 }}"
+        dup: "{{ item.1 }}"
+        assignments: "{{ query('ansible.platform.gateway_api', 'role_user_assignments',
+          query_params={'user_id': item.1.id},
           host=aap_hostname, username=aap_username,
           password=aap_password, verify_ssl=aap_validate_certs) }}"
-      loop: "{{ dupe_groups | subelements('1') | subelements('roles', skip_missing=True) }}"
+      loop: "{{ dupe_groups | map('list') | list | subelements('1') }}"
       loop_control:
-        label: "{{ item.0.1.username }}"
-      when: item.0.1.id != item.0.0.id
+        label: "{{ item.1.username }}"
+      when: item.1.id != item.0.id
+      loop_control:
+        extended: yes
+      with_items: "{{ assignments }}"
+      loop_control:
+        loop_var: role
 
     # ---- DELETE DUPLICATES ----
 
@@ -119,4 +151,4 @@
         validate_certs: "{{ aap_validate_certs }}"
         status_code: [204, 202]
       loop: "{{ dupe_groups | subelements('1') }}"
-      when: item.1.id != item.0.0.id
+      when: item.1.id != item.0.id
