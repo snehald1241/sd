@@ -27,7 +27,7 @@
              verify_ssl=aap_validate_certs) }}
 
     # -------------------------------------------------
-    # 2. GROUP BY EMAIL
+    # 2. GROUP USERS BY EMAIL
     # -------------------------------------------------
     - name: Group users by email
       ansible.builtin.set_fact:
@@ -36,7 +36,7 @@
       when: item.email is defined and item.email | length > 0
 
     # -------------------------------------------------
-    # 3. DUPLICATE GROUPS ONLY
+    # 3. BUILD DUPLICATE GROUPS
     # -------------------------------------------------
     - name: Build duplicate groups
       ansible.builtin.set_fact:
@@ -49,44 +49,85 @@
         dupe_groups: "{{ dupe_groups | default([]) }}"
 
     # -------------------------------------------------
-    # 4. BUILD MERGE JOBS (SAFE LOOP - NO JINJA TRAPS)
+    # 4. INIT FINAL MERGE JOB LIST
     # -------------------------------------------------
-    - name: Initialize merge jobs
+    - name: Initialize merge_jobs
       ansible.builtin.set_fact:
         merge_jobs: []
 
+    # -------------------------------------------------
+    # 5. SAFE BUILD (NO STRING CONVERSION POSSIBLE)
+    # -------------------------------------------------
     - name: Build merge jobs safely
       ansible.builtin.set_fact:
-        merge_jobs: "{{ merge_jobs + new_jobs }}"
+        merge_jobs: "{{ merge_jobs + [item] }}"
+      loop: >-
+        {{
+          lookup('ansible.builtin.pipe', 'echo ""')
+        }}
       vars:
-        new_jobs: >-
+        safe_jobs: >-
           {% set jobs = [] %}
-          {% set primary = item[0] %}
 
-          {% for dup in item[1:] %}
-            {% set assignments = query('ansible.platform.gateway_api', 'role_user_assignments',
-              query_params={'user_id': dup.id},
-              host=aap_hostname,
-              username=aap_username,
-              password=aap_password,
-              verify_ssl=aap_validate_certs) %}
+          {% for group in dupe_groups %}
+            {% set primary = group[0] %}
 
-            {% for a in assignments %}
-              {% set rid = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
+            {% for dup in group[1:] %}
+              {% set assignments = query('ansible.platform.gateway_api', 'role_user_assignments',
+                query_params={'user_id': dup.id},
+                host=aap_hostname,
+                username=aap_username,
+                password=aap_password,
+                verify_ssl=aap_validate_certs) %}
 
-              {% set _ = jobs.append({
-                "primary_id": primary.id,
-                "dup_id": dup.id,
-                "role_id": rid
-              }) %}
+              {% for a in assignments %}
+                {% set rid = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
+
+                {% set _ = jobs.append({
+                  "primary_id": primary.id,
+                  "dup_id": dup.id,
+                  "role_id": rid
+                }) %}
+              {% endfor %}
             {% endfor %}
           {% endfor %}
 
           {{ jobs }}
-      loop: "{{ dupe_groups }}"
+      run_once: true
+
+    - name: Set merge_jobs properly (final safe conversion)
+      ansible.builtin.set_fact:
+        merge_jobs: "{{ safe_jobs | from_yaml }}"
+      vars:
+        safe_jobs: >-
+          {% set jobs = [] %}
+
+          {% for group in dupe_groups %}
+            {% set primary = group[0] %}
+
+            {% for dup in group[1:] %}
+              {% set assignments = query('ansible.platform.gateway_api', 'role_user_assignments',
+                query_params={'user_id': dup.id},
+                host=aap_hostname,
+                username=aap_username,
+                password=aap_password,
+                verify_ssl=aap_validate_certs) %}
+
+              {% for a in assignments %}
+                {% set rid = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
+                {% set _ = jobs.append({
+                  "primary_id": primary.id,
+                  "dup_id": dup.id,
+                  "role_id": rid
+                }) %}
+              {% endfor %}
+            {% endfor %}
+          {% endfor %}
+
+          {{ jobs | to_json }}
 
     # -------------------------------------------------
-    # 5. ASSIGN ROLES TO PRIMARY USERS
+    # 6. ASSIGN ROLES (SAFE LOOP)
     # -------------------------------------------------
     - name: Assign roles to primary users
       ansible.builtin.uri:
@@ -101,13 +142,10 @@
           user: "{{ item.primary_id }}"
           role_definition: "{{ item.role_id }}"
         status_code: [200, 201, 204]
-      loop: "{{ merge_jobs }}"
-      when: merge_jobs | length > 0
-      loop_control:
-        label: "role {{ item.role_id }} -> user {{ item.primary_id }}"
+      loop: "{{ merge_jobs | default([]) }}"
 
     # -------------------------------------------------
-    # 6. DELETE DUPLICATE USERS
+    # 7. DELETE DUPLICATES
     # -------------------------------------------------
     - name: Delete duplicate users
       ansible.builtin.uri:
@@ -121,8 +159,8 @@
       loop: >-
         {{
           merge_jobs
+          | default([])
           | map(attribute='dup_id')
           | unique
           | list
         }}
-      when: merge_jobs | length > 0
