@@ -1,0 +1,154 @@
+---
+- name: Find duplicate users and their detailed permissions
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    aap_hostname: "{{ lookup('env', 'CONTROLLER_HOST') }}"
+    aap_username: "{{ lookup('env', 'CONTROLLER_USERNAME') }}"
+    aap_password: "{{ lookup('env', 'CONTROLLER_PASSWORD') }}"
+    aap_validate_certs: true
+
+  tasks:
+
+    # ---------------------------------------------------------
+    # EXISTING LOGIC (UNCHANGED)
+    # ---------------------------------------------------------
+
+    - name: Load all users
+      ansible.builtin.set_fact:
+        all_users: "{{ query('ansible.platform.gateway_api', 'users', return_all=True, return_objects=True, host=aap_hostname, username=aap_username, password=aap_password, verify_ssl=aap_validate_certs) }}"
+
+    - name: Group users by email
+      ansible.builtin.set_fact:
+        users_by_email: "{{ (users_by_email | default({})) | combine({ item.email: (users_by_email[item.email] | default([])) + [item] }) }}"
+      loop: "{{ all_users }}"
+      when: item.email is defined and item.email | length > 0
+
+    - name: Identify users with shared emails
+      ansible.builtin.set_fact:
+        dupe_users: "{{ dupe_users | default([]) + [item.1] }}"
+      loop: "{{ users_by_email | dict2items | subelements('value') }}"
+      when: (users_by_email[item.0.key] | length) > 1
+
+    - name: Collect Unique Role IDs
+      ansible.builtin.set_fact:
+        unique_role_ids: >-
+          {% set role_ids = [] %}
+          {% for u in dupe_users | default([]) %}
+            {% set assignments = query('ansible.platform.gateway_api', 'role_user_assignments', query_params={'user_id': u.id}, host=aap_hostname, username=aap_username, password=aap_password, verify_ssl=aap_validate_certs) %}
+            {% for a in assignments %}
+              {% set r_id = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
+              {% if r_id not in role_ids %}{% set _ = role_ids.append(r_id) %}{% endif %}
+            {% endfor %}
+          {% endfor %}
+          {{ role_ids }}
+
+    - name: Fetch and Map Role Permissions
+      ansible.builtin.set_fact:
+        role_cache: "{{ role_cache | default({}) | combine({ item | string: query('ansible.platform.gateway_api', 'role_definitions/' + item | string, host=aap_hostname, username=aap_username, password=aap_password, verify_ssl=aap_validate_certs)[0].permissions }) }}"
+      loop: "{{ unique_role_ids | from_yaml }}"
+      when: unique_role_ids is defined and unique_role_ids != "[]"
+
+    - name: Build User Permission Report
+      ansible.builtin.set_fact:
+        user_report: "{{ user_report | default([]) + [ {'user': item.username, 'email': item.email, 'all_permissions': final_perms | from_yaml | unique} ] }}"
+      vars:
+        assignments: "{{ query('ansible.platform.gateway_api', 'role_user_assignments', query_params={'user_id': item.id}, host=aap_hostname, username=aap_username, password=aap_password, verify_ssl=aap_validate_certs) }}"
+        final_perms: >-
+          {% set p_list = [] %}
+          {% for a in assignments %}
+            {% set r_id = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
+            {% set _ = p_list.extend(role_cache[r_id | string] | default([])) %}
+          {% endfor %}
+          {{ p_list }}
+      loop: "{{ dupe_users | default([]) }}"
+
+    - name: Display Pretty Summary
+      ansible.builtin.debug:
+        msg:
+          - "------------------------------------------------"
+          - "USER: {{ item.user }} ({{ item.email }})"
+          - "PERMISSIONS: {{ item.all_permissions | join(', ') }}"
+          - "------------------------------------------------"
+      loop: "{{ user_report | default([]) }}"
+
+    # =========================================================
+    # ✅ NEW CLEAN MERGE + DELETE LOGIC
+    # =========================================================
+
+    - name: Build duplicate groups
+      ansible.builtin.set_fact:
+        dupe_groups: "{{ dupe_groups | default([]) + [ item.value ] }}"
+      loop: "{{ users_by_email | dict2items }}"
+      when: item.value | length > 1
+
+    - name: Ensure dupe_groups exists
+      ansible.builtin.set_fact:
+        dupe_groups: "{{ dupe_groups | default([]) }}"
+
+    # ---------------------------------------------------------
+    # BUILD FLAT MERGE JOB LIST (KEY STEP)
+    # ---------------------------------------------------------
+
+    - name: Build merge job list
+      ansible.builtin.set_fact:
+        merge_jobs: "{{ merge_jobs | default([]) + job_list }}"
+      vars:
+        primary: "{{ item[0] }}"
+        duplicates: "{{ item[1:] }}"
+        job_list: >-
+          {% set jobs = [] %}
+          {% for d in duplicates %}
+            {% set assignments = query('ansible.platform.gateway_api', 'role_user_assignments',
+              query_params={'user_id': d.id},
+              host=aap_hostname, username=aap_username,
+              password=aap_password, verify_ssl=aap_validate_certs) %}
+            {% for a in assignments %}
+              {% set rid = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
+              {% set _ = jobs.append({'primary_id': primary.id, 'dup_id': d.id, 'role_id': rid}) %}
+            {% endfor %}
+          {% endfor %}
+          {{ jobs }}
+      loop: "{{ dupe_groups }}"
+      when: dupe_groups | length > 0
+
+    - name: Ensure merge_jobs exists
+      ansible.builtin.set_fact:
+        merge_jobs: "{{ merge_jobs | default([]) }}"
+
+    # ---------------------------------------------------------
+    # MERGE ROLES (SIMPLE LOOP)
+    # ---------------------------------------------------------
+
+    - name: Assign roles to primary user
+      ansible.builtin.uri:
+        url: "{{ aap_hostname }}/api/gateway/v1/role_user_assignments/"
+        method: POST
+        user: "{{ aap_username }}"
+        password: "{{ aap_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ aap_validate_certs }}"
+        body_format: json
+        body:
+          user: "{{ item.primary_id }}"
+          role_definition: "{{ item.role_id }}"
+      loop: "{{ merge_jobs }}"
+      when: merge_jobs | length > 0
+
+    # ---------------------------------------------------------
+    # DELETE DUPLICATES
+    # ---------------------------------------------------------
+
+    - name: Delete duplicate users
+      ansible.builtin.uri:
+        url: "{{ aap_hostname }}/api/gateway/v1/users/{{ item.dup_id }}/"
+        method: DELETE
+        user: "{{ aap_username }}"
+        password: "{{ aap_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ aap_validate_certs }}"
+        status_code: [204, 202]
+      loop: "{{ merge_jobs | map(attribute='dup_id') | unique | list }}"
+      when: merge_jobs | length > 0
