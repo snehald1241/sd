@@ -79,124 +79,109 @@
       loop_control:
         label: "{{ item.user }}"
 
-    # --- Merge duplicate accounts: copy roles to original user (lowest user id), then delete duplicate ---
-    # Requires ansible-core 2.11+ (loop on block). Skip changes: -e dupuser_merge_apply=false
-    - name: Build merge queue (original user = lowest id per shared email)
+    # --- Merge duplicate accounts (single playbook: no loop-on-block, no include_tasks) ---
+    # Plan is built in one set_fact (Jinja tracks role fingerprints per canonical across duplicates).
+    # Apply: all role POSTs, then superuser, then deletes. Skip API changes: -e dupuser_merge_apply=false
+    - name: Build merge plan (grants, superuser promotions, user deletions)
       ansible.builtin.set_fact:
-        merge_queue: "{{ merge_queue | default([]) + [{'email': item.0.key, 'canonical': item.0.value | sort(attribute='id') | first, 'duplicate': item.1}] }}"
-      loop: "{{ users_by_email | dict2items | subelements('value') }}"
-      when: (item.0.value | length) > 1 and (item.1.id != ((item.0.value | sort(attribute='id') | first).id))
-      loop_control:
-        label: "{{ item.1.username }} -> {{ (item.0.value | sort(attribute='id') | first).username }}"
+        merge_plan: "{{ merge_plan_json | from_json }}"
+      vars:
+        merge_plan_json: >-
+          {% set ns = namespace(grants=[], super_usernames=[], deletes=[]) %}
+          {% set super_seen = namespace(names=[]) %}
+          {% for email_entry in users_by_email | default({}) | dict2items %}
+          {% if email_entry.value | length > 1 %}
+          {% set sorted_u = email_entry.value | sort(attribute='id') %}
+          {% set canonical = sorted_u | first %}
+          {% set fps = namespace(list=[]) %}
+          {% set cas = query('ansible.platform.gateway_api', 'role_user_assignments', query_params={'user_id': canonical.id}, return_all=True, return_objects=True, host=aap_hostname, username=aap_username, password=aap_password, verify_ssl=aap_validate_certs) %}
+          {% for a in cas %}
+          {% set rd = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
+          {% set _ = fps.list.append(rd | string ~ '|' ~ (a.object_id | default('', true) | string) ~ '|' ~ (a.object_ansible_id | default('', true) | string)) %}
+          {% endfor %}
+          {% for dup in sorted_u[1:] %}
+          {% set das = query('ansible.platform.gateway_api', 'role_user_assignments', query_params={'user_id': dup.id}, return_all=True, return_objects=True, host=aap_hostname, username=aap_username, password=aap_password, verify_ssl=aap_validate_certs) %}
+          {% for a in das %}
+          {% set rd = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
+          {% set fp = rd | string ~ '|' ~ (a.object_id | default('', true) | string) ~ '|' ~ (a.object_ansible_id | default('', true) | string) %}
+          {% if fp not in fps.list %}
+          {% set _ = fps.list.append(fp) %}
+          {% if a.object_id is defined and a.object_id is not none %}
+          {% set _ = ns.grants.append({'role_definition': rd | int, 'user': canonical.id | int, 'object_id': a.object_id}) %}
+          {% elif a.object_ansible_id is defined and a.object_ansible_id is not none and (a.object_ansible_id | string | length > 0) %}
+          {% set _ = ns.grants.append({'role_definition': rd | int, 'user': canonical.id | int, 'object_ansible_id': a.object_ansible_id}) %}
+          {% else %}
+          {% set _ = ns.grants.append({'role_definition': rd | int, 'user': canonical.id | int}) %}
+          {% endif %}
+          {% endif %}
+          {% endfor %}
+          {% if dup.is_superuser | default(false) %}
+          {% if canonical.username not in super_seen.names %}
+          {% set _ = super_seen.names.append(canonical.username) %}
+          {% set _ = ns.super_usernames.append(canonical.username) %}
+          {% endif %}
+          {% endif %}
+          {% set _ = ns.deletes.append({'username': dup.username, 'email': dup.email}) %}
+          {% endfor %}
+          {% endif %}
+          {% endfor %}
+          {{ {'grants': ns.grants, 'super_usernames': ns.super_usernames, 'deletes': ns.deletes} | to_json }}
 
     - name: Gateway API base URL for role merge
       ansible.builtin.set_fact:
         gateway_api_base: "{{ aap_hostname | regex_replace('/$', '') }}"
-      when: merge_queue is defined and merge_queue | length > 0
 
-    - name: Merge duplicate permissions into original user and remove duplicate account
+    - name: Show merge plan only (dry run)
+      ansible.builtin.debug:
+        var: merge_plan
+      when: not (dupuser_merge_apply | default(true) | bool)
+
+    - name: POST role assignments onto original users
+      ansible.builtin.uri:
+        url: "{{ gateway_api_base }}/api/gateway/v1/role_user_assignments/"
+        method: POST
+        user: "{{ aap_username }}"
+        password: "{{ aap_password }}"
+        force_basic_auth: true
+        validate_certs: "{{ aap_validate_certs }}"
+        body_format: json
+        body: "{{ item }}"
+        status_code: [200, 201]
+      loop: "{{ merge_plan.grants | default([]) }}"
+      loop_control:
+        label: "role {{ item.role_definition }} -> user id {{ item.user }}"
       when:
         - dupuser_merge_apply | default(true) | bool
-        - merge_queue | default([]) | length > 0
-      block:
-        - name: Fetch role assignments for original (canonical) user
-          ansible.builtin.set_fact:
-            canonical_assignments: >-
-              {{
-                query(
-                  'ansible.platform.gateway_api',
-                  'role_user_assignments',
-                  query_params={'user_id': merge_entry.canonical.id},
-                  return_all=True,
-                  return_objects=True,
-                  host=aap_hostname,
-                  username=aap_username,
-                  password=aap_password,
-                  verify_ssl=aap_validate_certs,
-                )
-              }}
+        - merge_plan.grants | default([]) | length > 0
 
-        - name: Fetch role assignments for duplicate user
-          ansible.builtin.set_fact:
-            duplicate_assignments: >-
-              {{
-                query(
-                  'ansible.platform.gateway_api',
-                  'role_user_assignments',
-                  query_params={'user_id': merge_entry.duplicate.id},
-                  return_all=True,
-                  return_objects=True,
-                  host=aap_hostname,
-                  username=aap_username,
-                  password=aap_password,
-                  verify_ssl=aap_validate_certs,
-                )
-              }}
-
-        - name: Compute role_user_assignments to add on original user
-          ansible.builtin.set_fact:
-            role_grants: >-
-              {% set grants = [] %}
-              {% set seen = namespace(fps=[]) %}
-              {% for a in canonical_assignments %}
-              {% set rd = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
-              {% set _ = seen.fps.append(
-                   rd | string ~ '|' ~ (a.object_id | default('', true) | string) ~ '|' ~ (a.object_ansible_id | default('', true) | string)
-                 ) %}
-              {% endfor %}
-              {% for a in duplicate_assignments %}
-              {% set rd = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
-              {% set fp = rd | string ~ '|' ~ (a.object_id | default('', true) | string) ~ '|' ~ (a.object_ansible_id | default('', true) | string) %}
-              {% if fp not in seen.fps %}
-              {% set _ = seen.fps.append(fp) %}
-              {% if a.object_id is defined and a.object_id is not none %}
-              {% set _ = grants.append({'role_definition': rd | int, 'user': merge_entry.canonical.id | int, 'object_id': a.object_id}) %}
-              {% elif a.object_ansible_id is defined and a.object_ansible_id is not none and (a.object_ansible_id | string | length > 0) %}
-              {% set _ = grants.append({'role_definition': rd | int, 'user': merge_entry.canonical.id | int, 'object_ansible_id': a.object_ansible_id}) %}
-              {% else %}
-              {% set _ = grants.append({'role_definition': rd | int, 'user': merge_entry.canonical.id | int}) %}
-              {% endif %}
-              {% endif %}
-              {% endfor %}
-              {{ grants }}
-
-        - name: Apply merged roles on original user
-          ansible.builtin.uri:
-            url: "{{ gateway_api_base }}/api/gateway/v1/role_user_assignments/"
-            method: POST
-            user: "{{ aap_username }}"
-            password: "{{ aap_password }}"
-            force_basic_auth: true
-            validate_certs: "{{ aap_validate_certs }}"
-            body_format: json
-            body: "{{ role_grant_item }}"
-            status_code: [200, 201]
-          loop: "{{ role_grants }}"
-          loop_control:
-            loop_var: role_grant_item
-            label: "role {{ role_grant_item.role_definition }} -> {{ merge_entry.canonical.username }}"
-
-        - name: Promote original user to superuser if duplicate was superuser
-          ansible.platform.user:
-            username: "{{ merge_entry.canonical.username }}"
-            is_superuser: true
-            state: present
-            aap_hostname: "{{ aap_hostname }}"
-            aap_username: "{{ aap_username }}"
-            aap_password: "{{ aap_password }}"
-            aap_validate_certs: "{{ aap_validate_certs }}"
-          when: merge_entry.duplicate.is_superuser | default(false) | bool
-
-        - name: Remove duplicate user
-          ansible.platform.user:
-            username: "{{ merge_entry.duplicate.username }}"
-            email: "{{ merge_entry.duplicate.email }}"
-            state: absent
-            aap_hostname: "{{ aap_hostname }}"
-            aap_username: "{{ aap_username }}"
-            aap_password: "{{ aap_password }}"
-            aap_validate_certs: "{{ aap_validate_certs }}"
-      loop: "{{ merge_queue | default([]) }}"
+    - name: Promote original user to superuser when any duplicate was superuser
+      ansible.platform.user:
+        username: "{{ item }}"
+        is_superuser: true
+        state: present
+        aap_hostname: "{{ aap_hostname }}"
+        aap_username: "{{ aap_username }}"
+        aap_password: "{{ aap_password }}"
+        aap_validate_certs: "{{ aap_validate_certs }}"
+      loop: "{{ merge_plan.super_usernames | default([]) }}"
       loop_control:
-        loop_var: merge_entry
-        label: "{{ merge_entry.duplicate.username }}"
+        label: "{{ item }}"
+      when:
+        - dupuser_merge_apply | default(true) | bool
+        - merge_plan.super_usernames | default([]) | length > 0
+
+    - name: Remove duplicate user accounts
+      ansible.platform.user:
+        username: "{{ item.username }}"
+        email: "{{ item.email }}"
+        state: absent
+        aap_hostname: "{{ aap_hostname }}"
+        aap_username: "{{ aap_username }}"
+        aap_password: "{{ aap_password }}"
+        aap_validate_certs: "{{ aap_validate_certs }}"
+      loop: "{{ merge_plan.deletes | default([]) }}"
+      loop_control:
+        label: "{{ item.username }}"
+      when:
+        - dupuser_merge_apply | default(true) | bool
+        - merge_plan.deletes | default([]) | length > 0
