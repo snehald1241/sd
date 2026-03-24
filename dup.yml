@@ -1,5 +1,16 @@
 ---
-- name: Find duplicate users, merge roles, delete duplicates
+# Merge duplicate gateway users (same email): copy role assignments onto the canonical user
+# (lowest numeric user id), optionally align superuser, then delete the duplicate account.
+#
+# Requires ansible.platform collection. Set CONTROLLER_HOST, CONTROLLER_USERNAME, CONTROLLER_PASSWORD
+# (or gateway equivalents / module defaults).
+#
+# Extra vars:
+#   dupuser_apply: true   # set false to only print planned merges (no API changes)
+#
+# include: dupuser2_merge_once.yml (per-duplicate steps)
+#
+- name: Merge duplicate users — roles onto canonical user, remove duplicate
   hosts: localhost
   connection: local
   gather_facts: false
@@ -9,158 +20,79 @@
     aap_username: "{{ lookup('env', 'CONTROLLER_USERNAME') }}"
     aap_password: "{{ lookup('env', 'CONTROLLER_PASSWORD') }}"
     aap_validate_certs: true
+    dupuser_apply: true
+
+  module_defaults:
+    group/ansible.platform.gateway:
+      aap_hostname: "{{ aap_hostname }}"
+      aap_username: "{{ aap_username }}"
+      aap_password: "{{ aap_password }}"
+      aap_validate_certs: "{{ aap_validate_certs }}"
 
   tasks:
-
-    # -------------------------------------------------
-    # 1. LOAD USERS
-    # -------------------------------------------------
     - name: Load all users
       ansible.builtin.set_fact:
         all_users: >-
-          {{ query('ansible.platform.gateway_api', 'users',
-             return_all=True,
-             return_objects=True,
-             host=aap_hostname,
-             username=aap_username,
-             password=aap_password,
-             verify_ssl=aap_validate_certs) }}
+          {{
+            query(
+              'ansible.platform.gateway_api',
+              'users',
+              return_all=True,
+              return_objects=True,
+              host=aap_hostname,
+              username=aap_username,
+              password=aap_password,
+              verify_ssl=aap_validate_certs,
+            )
+          }}
 
-    # -------------------------------------------------
-    # 2. GROUP USERS BY EMAIL
-    # -------------------------------------------------
     - name: Group users by email
       ansible.builtin.set_fact:
-        users_by_email: "{{ users_by_email | default({}) | combine({ item.email: (users_by_email[item.email] | default([])) + [item] }) }}"
+        users_by_email: "{{ (users_by_email | default({})) | combine({ item.email: (users_by_email[item.email] | default([])) + [item] }) }}"
       loop: "{{ all_users }}"
       when: item.email is defined and item.email | length > 0
+      loop_control:
+        label: "{{ item.username }}"
 
-    # -------------------------------------------------
-    # 3. BUILD DUPLICATE GROUPS
-    # -------------------------------------------------
-    - name: Build duplicate groups
+    - name: Build merge queue (canonical = lowest user id per shared email)
       ansible.builtin.set_fact:
-        dupe_groups: "{{ dupe_groups | default([]) + [item.value] }}"
-      loop: "{{ users_by_email | dict2items }}"
-      when: item.value | length > 1
+        merge_queue: "{{ merge_queue | default([]) + [{'email': item.0.key, 'canonical': item.0.value | sort(attribute='id') | first, 'duplicate': item.1}] }}"
+      loop: "{{ users_by_email | dict2items | subelements('value') }}"
+      when: (item.0.value | length) > 1 and (item.1.id != ((item.0.value | sort(attribute='id') | first).id))
+      loop_control:
+        label: "{{ item.1.username }} -> {{ (item.0.value | sort(attribute='id') | first).username }}"
 
-    - name: Ensure dupe_groups exists
+    - name: No duplicate emails
+      ansible.builtin.debug:
+        msg: "No duplicate email addresses found."
+      when: merge_queue is not defined or merge_queue | length == 0
+
+    - name: Gateway API base URL (no trailing slash)
       ansible.builtin.set_fact:
-        dupe_groups: "{{ dupe_groups | default([]) }}"
+        gateway_api_base: "{{ aap_hostname | regex_replace('/$', '') }}"
+      when: merge_queue is defined and merge_queue | length > 0
 
-    # -------------------------------------------------
-    # 4. INIT FINAL MERGE JOB LIST
-    # -------------------------------------------------
-    - name: Initialize merge_jobs
-      ansible.builtin.set_fact:
-        merge_jobs: []
+    - name: Apply merges (roles + remove duplicates)
+      ansible.builtin.include_tasks:
+        file: dupuser2_merge_once.yml
+      loop: "{{ merge_queue }}"
+      loop_control:
+        loop_var: merge_entry
+        label: "{{ merge_entry.duplicate.username }}"
+      when:
+        - dupuser_apply | bool
+        - merge_queue is defined
+        - merge_queue | length > 0
 
-    # -------------------------------------------------
-    # 5. SAFE BUILD (NO STRING CONVERSION POSSIBLE)
-    # -------------------------------------------------
-    - name: Build merge jobs safely
-      ansible.builtin.set_fact:
-        merge_jobs: "{{ merge_jobs + [item] }}"
-      loop: >-
-        {{
-          lookup('ansible.builtin.pipe', 'echo ""')
-        }}
-      vars:
-        safe_jobs: >-
-          {% set jobs = [] %}
+    - name: Dry run — show planned merges only
+      ansible.builtin.debug:
+        var: merge_queue
+      when:
+        - not (dupuser_apply | bool)
+        - merge_queue is defined
+        - merge_queue | length > 0
 
-          {% for group in dupe_groups %}
-            {% set primary = group[0] %}
-
-            {% for dup in group[1:] %}
-              {% set assignments = query('ansible.platform.gateway_api', 'role_user_assignments',
-                query_params={'user_id': dup.id},
-                host=aap_hostname,
-                username=aap_username,
-                password=aap_password,
-                verify_ssl=aap_validate_certs) %}
-
-              {% for a in assignments %}
-                {% set rid = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
-
-                {% set _ = jobs.append({
-                  "primary_id": primary.id,
-                  "dup_id": dup.id,
-                  "role_id": rid
-                }) %}
-              {% endfor %}
-            {% endfor %}
-          {% endfor %}
-
-          {{ jobs }}
-      run_once: true
-
-    - name: Set merge_jobs properly (final safe conversion)
-      ansible.builtin.set_fact:
-        merge_jobs: "{{ safe_jobs | from_yaml }}"
-      vars:
-        safe_jobs: >-
-          {% set jobs = [] %}
-
-          {% for group in dupe_groups %}
-            {% set primary = group[0] %}
-
-            {% for dup in group[1:] %}
-              {% set assignments = query('ansible.platform.gateway_api', 'role_user_assignments',
-                query_params={'user_id': dup.id},
-                host=aap_hostname,
-                username=aap_username,
-                password=aap_password,
-                verify_ssl=aap_validate_certs) %}
-
-              {% for a in assignments %}
-                {% set rid = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
-                {% set _ = jobs.append({
-                  "primary_id": primary.id,
-                  "dup_id": dup.id,
-                  "role_id": rid
-                }) %}
-              {% endfor %}
-            {% endfor %}
-          {% endfor %}
-
-          {{ jobs | to_json }}
-
-    # -------------------------------------------------
-    # 6. ASSIGN ROLES (SAFE LOOP)
-    # -------------------------------------------------
-    - name: Assign roles to primary users
-      ansible.builtin.uri:
-        url: "{{ aap_hostname }}/api/gateway/v1/role_user_assignments/"
-        method: POST
-        user: "{{ aap_username }}"
-        password: "{{ aap_password }}"
-        force_basic_auth: true
-        validate_certs: "{{ aap_validate_certs }}"
-        body_format: json
-        body:
-          user: "{{ item.primary_id }}"
-          role_definition: "{{ item.role_id }}"
-        status_code: [200, 201, 204]
-      loop: "{{ merge_jobs | default([]) }}"
-
-    # -------------------------------------------------
-    # 7. DELETE DUPLICATES
-    # -------------------------------------------------
-    - name: Delete duplicate users
-      ansible.builtin.uri:
-        url: "{{ aap_hostname }}/api/gateway/v1/users/{{ item }}/"
-        method: DELETE
-        user: "{{ aap_username }}"
-        password: "{{ aap_password }}"
-        force_basic_auth: true
-        validate_certs: "{{ aap_validate_certs }}"
-        status_code: [202, 204]
-      loop: >-
-        {{
-          merge_jobs
-          | default([])
-          | map(attribute='dup_id')
-          | unique
-          | list
-        }}
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "Queued {{ merge_queue | default([]) | length }} duplicate user(s); dupuser_apply={{ dupuser_apply }}."
+      when: merge_queue is defined
