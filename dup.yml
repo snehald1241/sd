@@ -1,16 +1,5 @@
 ---
-# Merge duplicate gateway users (same email): copy role assignments onto the canonical user
-# (lowest numeric user id), optionally align superuser, then delete the duplicate account.
-#
-# Requires ansible.platform collection. Set CONTROLLER_HOST, CONTROLLER_USERNAME, CONTROLLER_PASSWORD
-# (or gateway equivalents / module defaults).
-#
-# Extra vars:
-#   dupuser_apply: true   # set false to only print planned merges (no API changes)
-#
-# include: dupuser2_merge_once.yml (per-duplicate steps)
-#
-- name: Merge duplicate users — roles onto canonical user, remove duplicate
+- name: Find duplicate users and their detailed permissions
   hosts: localhost
   connection: local
   gather_facts: false
@@ -20,31 +9,11 @@
     aap_username: "{{ lookup('env', 'CONTROLLER_USERNAME') }}"
     aap_password: "{{ lookup('env', 'CONTROLLER_PASSWORD') }}"
     aap_validate_certs: true
-    dupuser_apply: true
-
-  module_defaults:
-    group/ansible.platform.gateway:
-      aap_hostname: "{{ aap_hostname }}"
-      aap_username: "{{ aap_username }}"
-      aap_password: "{{ aap_password }}"
-      aap_validate_certs: "{{ aap_validate_certs }}"
 
   tasks:
     - name: Load all users
       ansible.builtin.set_fact:
-        all_users: >-
-          {{
-            query(
-              'ansible.platform.gateway_api',
-              'users',
-              return_all=True,
-              return_objects=True,
-              host=aap_hostname,
-              username=aap_username,
-              password=aap_password,
-              verify_ssl=aap_validate_certs,
-            )
-          }}
+        all_users: "{{ query('ansible.platform.gateway_api', 'users', return_all=True, return_objects=True, host=aap_hostname, username=aap_username, password=aap_password, verify_ssl=aap_validate_certs) }}"
 
     - name: Group users by email
       ansible.builtin.set_fact:
@@ -54,7 +23,65 @@
       loop_control:
         label: "{{ item.username }}"
 
-    - name: Build merge queue (canonical = lowest user id per shared email)
+    - name: Identify users with shared emails
+      ansible.builtin.set_fact:
+        dupe_users: "{{ dupe_users | default([]) + [item.1] }}"
+      loop: "{{ users_by_email | dict2items | subelements('value') }}"
+      when: (users_by_email[item.0.key] | length) > 1
+      loop_control:
+        label: "{{ item.1.username }}"
+
+    - name: Collect Unique Role IDs
+      ansible.builtin.set_fact:
+        unique_role_ids: >-
+          {% set role_ids = [] %}
+          {% for u in dupe_users | default([]) %}
+            {% set assignments = query('ansible.platform.gateway_api', 'role_user_assignments', query_params={'user_id': u.id}, host=aap_hostname, username=aap_username, password=aap_password, verify_ssl=aap_validate_certs) %}
+            {% for a in assignments %}
+              {% set r_id = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
+              {% if r_id not in role_ids %}{% set _ = role_ids.append(r_id) %}{% endif %}
+            {% endfor %}
+          {% endfor %}
+          {{ role_ids }}
+
+    - name: Fetch and Map Role Permissions
+      ansible.builtin.set_fact:
+        role_cache: "{{ role_cache | default({}) | combine({ item | string: query('ansible.platform.gateway_api', 'role_definitions/' + item | string, host=aap_hostname, username=aap_username, password=aap_password, verify_ssl=aap_validate_certs)[0].permissions }) }}"
+      loop: "{{ unique_role_ids | from_yaml }}"
+      loop_control:
+        label: "Caching Permissions for Role ID: {{ item }}"
+      when: unique_role_ids is defined and unique_role_ids != "[]"
+
+    - name: Build User Permission Report
+      ansible.builtin.set_fact:
+        user_report: "{{ user_report | default([]) + [ {'user': item.username, 'email': item.email, 'all_permissions': final_perms | from_yaml | unique} ] }}"
+      vars:
+        assignments: "{{ query('ansible.platform.gateway_api', 'role_user_assignments', query_params={'user_id': item.id}, host=aap_hostname, username=aap_username, password=aap_password, verify_ssl=aap_validate_certs) }}"
+        final_perms: >-
+          {% set p_list = [] %}
+          {% for a in assignments %}
+            {% set r_id = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
+            {% set _ = p_list.extend(role_cache[r_id | string] | default([])) %}
+          {% endfor %}
+          {{ p_list }}
+      loop: "{{ dupe_users | default([]) }}"
+      loop_control:
+        label: "Compiling report for {{ item.username }}"
+
+    - name: Display Pretty Summary
+      ansible.builtin.debug:
+        msg: 
+          - "------------------------------------------------"
+          - "USER: {{ item.user }} ({{ item.email }})"
+          - "PERMISSIONS: {{ item.all_permissions | join(', ') }}"
+          - "------------------------------------------------"
+      loop: "{{ user_report | default([]) }}"
+      loop_control:
+        label: "{{ item.user }}"
+
+    # --- Merge duplicate accounts: copy roles to original user (lowest user id), then delete duplicate ---
+    # Requires ansible-core 2.11+ (loop on block). Skip changes: -e dupuser_merge_apply=false
+    - name: Build merge queue (original user = lowest id per shared email)
       ansible.builtin.set_fact:
         merge_queue: "{{ merge_queue | default([]) + [{'email': item.0.key, 'canonical': item.0.value | sort(attribute='id') | first, 'duplicate': item.1}] }}"
       loop: "{{ users_by_email | dict2items | subelements('value') }}"
@@ -62,37 +89,114 @@
       loop_control:
         label: "{{ item.1.username }} -> {{ (item.0.value | sort(attribute='id') | first).username }}"
 
-    - name: No duplicate emails
-      ansible.builtin.debug:
-        msg: "No duplicate email addresses found."
-      when: merge_queue is not defined or merge_queue | length == 0
-
-    - name: Gateway API base URL (no trailing slash)
+    - name: Gateway API base URL for role merge
       ansible.builtin.set_fact:
         gateway_api_base: "{{ aap_hostname | regex_replace('/$', '') }}"
       when: merge_queue is defined and merge_queue | length > 0
 
-    - name: Apply merges (roles + remove duplicates)
-      ansible.builtin.include_tasks:
-        file: dupuser2_merge_once.yml
-      loop: "{{ merge_queue }}"
+    - name: Merge duplicate permissions into original user and remove duplicate account
+      when:
+        - dupuser_merge_apply | default(true) | bool
+        - merge_queue | default([]) | length > 0
+      block:
+        - name: Fetch role assignments for original (canonical) user
+          ansible.builtin.set_fact:
+            canonical_assignments: >-
+              {{
+                query(
+                  'ansible.platform.gateway_api',
+                  'role_user_assignments',
+                  query_params={'user_id': merge_entry.canonical.id},
+                  return_all=True,
+                  return_objects=True,
+                  host=aap_hostname,
+                  username=aap_username,
+                  password=aap_password,
+                  verify_ssl=aap_validate_certs,
+                )
+              }}
+
+        - name: Fetch role assignments for duplicate user
+          ansible.builtin.set_fact:
+            duplicate_assignments: >-
+              {{
+                query(
+                  'ansible.platform.gateway_api',
+                  'role_user_assignments',
+                  query_params={'user_id': merge_entry.duplicate.id},
+                  return_all=True,
+                  return_objects=True,
+                  host=aap_hostname,
+                  username=aap_username,
+                  password=aap_password,
+                  verify_ssl=aap_validate_certs,
+                )
+              }}
+
+        - name: Compute role_user_assignments to add on original user
+          ansible.builtin.set_fact:
+            role_grants: >-
+              {% set grants = [] %}
+              {% set seen = namespace(fps=[]) %}
+              {% for a in canonical_assignments %}
+              {% set rd = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
+              {% set _ = seen.fps.append(
+                   rd | string ~ '|' ~ (a.object_id | default('', true) | string) ~ '|' ~ (a.object_ansible_id | default('', true) | string)
+                 ) %}
+              {% endfor %}
+              {% for a in duplicate_assignments %}
+              {% set rd = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
+              {% set fp = rd | string ~ '|' ~ (a.object_id | default('', true) | string) ~ '|' ~ (a.object_ansible_id | default('', true) | string) %}
+              {% if fp not in seen.fps %}
+              {% set _ = seen.fps.append(fp) %}
+              {% if a.object_id is defined and a.object_id is not none %}
+              {% set _ = grants.append({'role_definition': rd | int, 'user': merge_entry.canonical.id | int, 'object_id': a.object_id}) %}
+              {% elif a.object_ansible_id is defined and a.object_ansible_id is not none and (a.object_ansible_id | string | length > 0) %}
+              {% set _ = grants.append({'role_definition': rd | int, 'user': merge_entry.canonical.id | int, 'object_ansible_id': a.object_ansible_id}) %}
+              {% else %}
+              {% set _ = grants.append({'role_definition': rd | int, 'user': merge_entry.canonical.id | int}) %}
+              {% endif %}
+              {% endif %}
+              {% endfor %}
+              {{ grants }}
+
+        - name: Apply merged roles on original user
+          ansible.builtin.uri:
+            url: "{{ gateway_api_base }}/api/gateway/v1/role_user_assignments/"
+            method: POST
+            user: "{{ aap_username }}"
+            password: "{{ aap_password }}"
+            force_basic_auth: true
+            validate_certs: "{{ aap_validate_certs }}"
+            body_format: json
+            body: "{{ role_grant_item }}"
+            status_code: [200, 201]
+          loop: "{{ role_grants }}"
+          loop_control:
+            loop_var: role_grant_item
+            label: "role {{ role_grant_item.role_definition }} -> {{ merge_entry.canonical.username }}"
+
+        - name: Promote original user to superuser if duplicate was superuser
+          ansible.platform.user:
+            username: "{{ merge_entry.canonical.username }}"
+            is_superuser: true
+            state: present
+            aap_hostname: "{{ aap_hostname }}"
+            aap_username: "{{ aap_username }}"
+            aap_password: "{{ aap_password }}"
+            aap_validate_certs: "{{ aap_validate_certs }}"
+          when: merge_entry.duplicate.is_superuser | default(false) | bool
+
+        - name: Remove duplicate user
+          ansible.platform.user:
+            username: "{{ merge_entry.duplicate.username }}"
+            email: "{{ merge_entry.duplicate.email }}"
+            state: absent
+            aap_hostname: "{{ aap_hostname }}"
+            aap_username: "{{ aap_username }}"
+            aap_password: "{{ aap_password }}"
+            aap_validate_certs: "{{ aap_validate_certs }}"
+      loop: "{{ merge_queue | default([]) }}"
       loop_control:
         loop_var: merge_entry
         label: "{{ merge_entry.duplicate.username }}"
-      when:
-        - dupuser_apply | bool
-        - merge_queue is defined
-        - merge_queue | length > 0
-
-    - name: Dry run — show planned merges only
-      ansible.builtin.debug:
-        var: merge_queue
-      when:
-        - not (dupuser_apply | bool)
-        - merge_queue is defined
-        - merge_queue | length > 0
-
-    - name: Summary
-      ansible.builtin.debug:
-        msg: "Queued {{ merge_queue | default([]) | length }} duplicate user(s); dupuser_apply={{ dupuser_apply }}."
-      when: merge_queue is defined
