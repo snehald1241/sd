@@ -11,6 +11,14 @@
     aap_validate_certs: true
 
   tasks:
+    # urllib (used by ansible.builtin.uri) requires a scheme; CONTROLLER_HOST is often set as host:port only.
+    - name: Normalize gateway URL for API access
+      ansible.builtin.set_fact:
+        aap_hostname: "{{ _trim if (_trim | regex_search('(?i)^https?://')) else ('https://' ~ (_trim | regex_replace('^/+', ''))) }}"
+      vars:
+        _trim: "{{ aap_hostname | default('', true) | trim | regex_replace('/$', '') }}"
+      when: _trim | length > 0
+
     - name: Load all users
       ansible.builtin.set_fact:
         all_users: "{{ query('ansible.platform.gateway_api', 'users', return_all=True, return_objects=True, host=aap_hostname, username=aap_username, password=aap_password, verify_ssl=aap_validate_certs) }}"
@@ -79,9 +87,9 @@
       loop_control:
         label: "{{ item.user }}"
 
-    # --- Merge duplicate accounts (single playbook: no loop-on-block, no include_tasks) ---
-    # Plan is built in one set_fact (Jinja tracks role fingerprints per canonical across duplicates).
-    # Apply: all role POSTs, then superuser, then deletes. Skip API changes: -e dupuser_merge_apply=false
+    # --- Merge duplicates: copy roles to original user (lowest id per email), then remove duplicate accounts ---
+    # Single playbook (no include_tasks / no loop-on-block). Plan built in one set_fact; apply with separate loops.
+    # Skip API changes: ansible-playbook ... -e dupuser_merge_apply=false
     - name: Build merge plan (grants, superuser promotions, user deletions)
       ansible.builtin.set_fact:
         merge_plan: "{{ merge_plan_json | from_json }}"
@@ -127,25 +135,62 @@
           {% endfor %}
           {{ {'grants': ns.grants, 'super_usernames': ns.super_usernames, 'deletes': ns.deletes} | to_json }}
 
-    - name: Gateway API base URL for role merge
-      ansible.builtin.set_fact:
-        gateway_api_base: "{{ aap_hostname | regex_replace('/$', '') }}"
-
     - name: Show merge plan only (dry run)
       ansible.builtin.debug:
         var: merge_plan
       when: not (dupuser_merge_apply | default(true) | bool)
 
-    - name: POST role assignments onto original users
+    - name: Grant merged team/org roles (object_id) on original users
+      ansible.platform.role_user_assignment:
+        role_definition: "{{ item.role_definition | string }}"
+        user: "{{ item.user | string }}"
+        object_ids: "{{ [ item.object_id | string ] }}"
+        state: present
+        aap_hostname: "{{ aap_hostname }}"
+        aap_username: "{{ aap_username }}"
+        aap_password: "{{ aap_password }}"
+        aap_validate_certs: "{{ aap_validate_certs }}"
+      loop: "{{ merge_plan.grants | default([]) }}"
+      loop_control:
+        label: "role {{ item.role_definition }} user {{ item.user }} object_id {{ item.object_id }}"
+      when:
+        - dupuser_merge_apply | default(true) | bool
+        - merge_plan.grants | default([]) | length > 0
+        - item.object_id is defined
+        - item.object_id is not none
+
+    - name: Grant merged roles (object_ansible_id) on original users
+      ansible.platform.role_user_assignment:
+        role_definition: "{{ item.role_definition | string }}"
+        user: "{{ item.user | string }}"
+        object_ansible_id: "{{ item.object_ansible_id }}"
+        state: present
+        aap_hostname: "{{ aap_hostname }}"
+        aap_username: "{{ aap_username }}"
+        aap_password: "{{ aap_password }}"
+        aap_validate_certs: "{{ aap_validate_certs }}"
+      loop: "{{ merge_plan.grants | default([]) }}"
+      loop_control:
+        label: "role {{ item.role_definition }} user {{ item.user }} ansible_id"
+      when:
+        - dupuser_merge_apply | default(true) | bool
+        - merge_plan.grants | default([]) | length > 0
+        - item.object_ansible_id is defined
+        - item.object_ansible_id | default('', true) | string | length > 0
+        - item.object_id is not defined or item.object_id is none
+
+    - name: Grant merged platform roles without object (direct API POST)
       ansible.builtin.uri:
-        url: "{{ gateway_api_base }}/api/gateway/v1/role_user_assignments/"
+        url: "{{ (aap_hostname | regex_replace('/$', '')) }}/api/gateway/v1/role_user_assignments/"
         method: POST
         user: "{{ aap_username }}"
         password: "{{ aap_password }}"
         force_basic_auth: true
         validate_certs: "{{ aap_validate_certs }}"
         body_format: json
-        body: "{{ item }}"
+        body:
+          role_definition: "{{ item.role_definition }}"
+          user: "{{ item.user }}"
         status_code: [200, 201]
       loop: "{{ merge_plan.grants | default([]) }}"
       loop_control:
@@ -153,6 +198,8 @@
       when:
         - dupuser_merge_apply | default(true) | bool
         - merge_plan.grants | default([]) | length > 0
+        - item.object_id is not defined or item.object_id is none
+        - item.object_ansible_id is not defined or (item.object_ansible_id | default('') | string | length == 0)
 
     - name: Promote original user to superuser when any duplicate was superuser
       ansible.platform.user:
