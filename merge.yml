@@ -14,8 +14,10 @@
 #   2) Or set execution environment / credential custom env var MERGE_USER_ROLE_MAPPINGS
 #      to a JSON array, e.g. [{"from_user_id":1,"to_user_id":2}]
 #
-#   3) Gateway URL: Job Template Extra Variable aap_host: https://your-platform.example.com
-#      if CONTROLLER_HOST is not injected (required for ansible.builtin.uri).
+#   3) Gateway URL (ansible.builtin.uri needs a host). Use either:
+#        aap_host: https://your-platform.example.com
+#      or (same as ansible.platform modules / common lab vars):
+#        aap_hostname: your-platform.example.com   # https:// added if scheme omitted
 #
 # (Survey variables must be named user_role_mappings, or use Extra Variables as above.)
 #
@@ -35,7 +37,7 @@
   connection: local
   gather_facts: false
   vars:
-    # Extra var aap_host (Job Template) overrides this. Otherwise env CONTROLLER_HOST, then GATEWAY_HOSTNAME.
+    # Extra vars override these. aap_hostname alone is OK — a task copies it to aap_host when env is empty.
     aap_host: "{{ lookup('env', 'CONTROLLER_HOST') | default(lookup('env', 'GATEWAY_HOSTNAME'), true) }}"
     aap_username: "{{ lookup('env', 'CONTROLLER_USERNAME') }}"
     aap_password: "{{ lookup('env', 'CONTROLLER_PASSWORD') }}"
@@ -80,6 +82,15 @@
       loop_control:
         label: "{{ item.from_user_id | default('?') }} -> {{ item.to_user_id | default('?') }}"
 
+    # Many Job Templates use aap_hostname (ansible.platform) but this playbook originally only read aap_host / env.
+    - name: Use aap_hostname when aap_host is empty
+      ansible.builtin.set_fact:
+        aap_host: "{{ aap_hostname | trim }}"
+      when: >-
+        (aap_host | default('', true) | trim | length == 0) and
+        (aap_hostname is defined) and
+        (aap_hostname | default('', true) | trim | length > 0)
+
     # ansible.builtin.uri needs an absolute URL (scheme + host). Empty aap_host yields "/api/..." and fails.
     - name: Normalize gateway base URL (prepend https if scheme omitted)
       ansible.builtin.set_fact:
@@ -95,11 +106,12 @@
         fail_msg: >-
           Gateway URL is empty, so API calls became relative paths like '/api/gateway/v1/...' and uri failed.
 
-          Fix in AAP: use a credential type that injects CONTROLLER_HOST (full URL, e.g. https://aap.example.com),
-          or set Job Template Extra Variables:
-            aap_host: https://your-gateway-or-controller.example.com
+          Fix in AAP: use a credential that injects CONTROLLER_HOST, or set Extra Variables, e.g.:
+            aap_host: https://your-gateway.example.com
+          or (common with ansible.platform modules):
+            aap_hostname: your-gateway.example.com
 
-          Optional env fallbacks used by this playbook: CONTROLLER_HOST, GATEWAY_HOSTNAME.
+          Env fallbacks: CONTROLLER_HOST, GATEWAY_HOSTNAME.
 
     # ========================================
     # 2. Load Users for Display
