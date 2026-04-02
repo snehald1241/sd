@@ -1,5 +1,21 @@
 ---
 #
+# Source: https://github.com/snehald1241/sd/blob/main/merge.yml
+#
+# Usage on Ansible Automation Platform (AAP):
+#
+#   1) Job Template for this playbook → Edit → Variables:
+#      - Paste under "Extra Variables" (YAML), exactly this key name:
+#
+#        user_role_mappings:
+#          - from_user_id: 1
+#            to_user_id: 2
+#
+#   2) Or set execution environment / credential custom env var MERGE_USER_ROLE_MAPPINGS
+#      to a JSON array, e.g. [{"from_user_id":1,"to_user_id":2}]
+#
+# (Survey variables must be named user_role_mappings, or use Extra Variables as above.)
+#
 # Usage: Run via AAP Job Template with extra variable:
 #
 #   user_role_mappings:
@@ -25,16 +41,29 @@
     # ========================================
     # 1. Validate Input
     # ========================================
+    - name: Load user_role_mappings from MERGE_USER_ROLE_MAPPINGS env (JSON) if not passed as extra var
+      ansible.builtin.set_fact:
+        user_role_mappings: "{{ lookup('env', 'MERGE_USER_ROLE_MAPPINGS') | trim | from_json }}"
+      when: >-
+        user_role_mappings is not defined and
+        (lookup('env', 'MERGE_USER_ROLE_MAPPINGS') | default('', true) | trim | length > 0)
+
     - name: Validate user_role_mappings is provided
       ansible.builtin.assert:
         that:
           - user_role_mappings is defined
           - user_role_mappings | length > 0
         fail_msg: >-
-          You must define 'user_role_mappings' as a list of from/to pairs, e.g.:
+          Extra variable 'user_role_mappings' was not supplied (or was empty).
+
+          In AAP: open the Job Template → Variables → Extra Variables, and add YAML such as:
+
           user_role_mappings:
             - from_user_id: 1
               to_user_id: 2
+
+          Or set environment variable MERGE_USER_ROLE_MAPPINGS to a JSON array, for example:
+          [{"from_user_id": 1, "to_user_id": 2}]
 
     - name: Validate each mapping has required fields
       ansible.builtin.assert:
