@@ -14,6 +14,9 @@
 #   2) Or set execution environment / credential custom env var MERGE_USER_ROLE_MAPPINGS
 #      to a JSON array, e.g. [{"from_user_id":1,"to_user_id":2}]
 #
+#   3) Gateway URL: Job Template Extra Variable aap_host: https://your-platform.example.com
+#      if CONTROLLER_HOST is not injected (required for ansible.builtin.uri).
+#
 # (Survey variables must be named user_role_mappings, or use Extra Variables as above.)
 #
 # Usage: Run via AAP Job Template with extra variable:
@@ -32,7 +35,8 @@
   connection: local
   gather_facts: false
   vars:
-    aap_host: "{{ lookup('env', 'CONTROLLER_HOST') }}"
+    # Extra var aap_host (Job Template) overrides this. Otherwise env CONTROLLER_HOST, then GATEWAY_HOSTNAME.
+    aap_host: "{{ lookup('env', 'CONTROLLER_HOST') | default(lookup('env', 'GATEWAY_HOSTNAME'), true) }}"
     aap_username: "{{ lookup('env', 'CONTROLLER_USERNAME') }}"
     aap_password: "{{ lookup('env', 'CONTROLLER_PASSWORD') }}"
     aap_validate_certs: "{{ controller_validate_certs | default(true) }}"
@@ -75,6 +79,27 @@
       loop: "{{ user_role_mappings }}"
       loop_control:
         label: "{{ item.from_user_id | default('?') }} -> {{ item.to_user_id | default('?') }}"
+
+    # ansible.builtin.uri needs an absolute URL (scheme + host). Empty aap_host yields "/api/..." and fails.
+    - name: Normalize gateway base URL (prepend https if scheme omitted)
+      ansible.builtin.set_fact:
+        aap_host: "{{ _trim if (_trim | regex_search('(?i)^https?://')) else ('https://' ~ (_trim | regex_replace('^/+', ''))) }}"
+      vars:
+        _trim: "{{ aap_host | default('', true) | trim | regex_replace('/$', '') }}"
+      when: _trim | length > 0
+
+    - name: Assert gateway base URL is set
+      ansible.builtin.assert:
+        that:
+          - aap_host | default('', true) | trim | length > 0
+        fail_msg: >-
+          Gateway URL is empty, so API calls became relative paths like '/api/gateway/v1/...' and uri failed.
+
+          Fix in AAP: use a credential type that injects CONTROLLER_HOST (full URL, e.g. https://aap.example.com),
+          or set Job Template Extra Variables:
+            aap_host: https://your-gateway-or-controller.example.com
+
+          Optional env fallbacks used by this playbook: CONTROLLER_HOST, GATEWAY_HOSTNAME.
 
     # ========================================
     # 2. Load Users for Display
