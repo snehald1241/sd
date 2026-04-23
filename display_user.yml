@@ -1,0 +1,142 @@
+---
+- name: List users with specific galaxy permissions
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    aap_hostname: "{{ lookup('env', 'CONTROLLER_HOST') }}"
+    aap_username: "{{ lookup('env', 'CONTROLLER_USERNAME') }}"
+    aap_password: "{{ lookup('env', 'CONTROLLER_PASSWORD') }}"
+    aap_validate_certs: true
+
+    # Target galaxy permissions to search for
+    target_galaxy_permissions:
+      - galaxy.change_task
+      - galaxy.delete_task
+      - galaxy.manage_roles_task
+      - galaxy.view_task
+      - galaxy.add_task
+
+  tasks:
+    - name: Load all users
+      ansible.builtin.set_fact:
+        all_users: "{{ query('ansible.platform.gateway_api', 'users', return_all=True, return_objects=True, host=aap_hostname, username=aap_username, password=aap_password, verify_ssl=aap_validate_certs) }}"
+
+    - name: Display total users found
+      ansible.builtin.debug:
+        msg: "Total users in system: {{ all_users | length }}"
+
+    - name: Collect unique role IDs from all users
+      ansible.builtin.set_fact:
+        unique_role_ids: >-
+          {% set role_ids = [] %}
+          {% for u in all_users %}
+            {% set assignments = query('ansible.platform.gateway_api', 'role_user_assignments', query_params={'user_id': u.id}, host=aap_hostname, username=aap_username, password=aap_password, verify_ssl=aap_validate_certs) %}
+            {% for a in assignments %}
+              {% set r_id = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
+              {% if r_id not in role_ids %}{% set _ = role_ids.append(r_id) %}{% endif %}
+            {% endfor %}
+          {% endfor %}
+          {{ role_ids }}
+
+    - name: Fetch and cache role permissions
+      ansible.builtin.set_fact:
+        role_cache: "{{ role_cache | default({}) | combine({ item | string: query('ansible.platform.gateway_api', 'role_definitions/' + item | string, host=aap_hostname, username=aap_username, password=aap_password, verify_ssl=aap_validate_certs)[0] }) }}"
+      loop: "{{ unique_role_ids | from_yaml }}"
+      loop_control:
+        label: "Caching role ID: {{ item }}"
+      when: unique_role_ids is defined and unique_role_ids != "[]"
+
+    - name: Build user permission report with galaxy filter
+      ansible.builtin.set_fact:
+        users_with_galaxy_perms: "{{ users_with_galaxy_perms | default([]) + [user_entry] }}"
+      vars:
+        assignments: "{{ query('ansible.platform.gateway_api', 'role_user_assignments', query_params={'user_id': item.id}, host=aap_hostname, username=aap_username, password=aap_password, verify_ssl=aap_validate_certs) }}"
+        all_perms: >-
+          {% set p_list = [] %}
+          {% for a in assignments %}
+            {% set r_id = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
+            {% set perms = role_cache[r_id | string].permissions | default([]) %}
+            {% set _ = p_list.extend(perms) %}
+          {% endfor %}
+          {{ p_list }}
+        matching_galaxy_perms: "{{ (all_perms | from_yaml | unique) | intersect(target_galaxy_permissions) }}"
+        user_entry:
+          username: "{{ item.username }}"
+          user_id: "{{ item.id }}"
+          email: "{{ item.email | default('N/A') }}"
+          galaxy_permissions: "{{ matching_galaxy_perms }}"
+          role_assignments: >-
+            {% set role_list = [] %}
+            {% for a in assignments %}
+              {% set r_id = a.role_definition.id if a.role_definition is mapping else a.role_definition %}
+              {% set role_name = role_cache[r_id | string].name | default('Unknown') %}
+              {% set _ = role_list.append(role_name) %}
+            {% endfor %}
+            {{ role_list | unique }}
+      loop: "{{ all_users }}"
+      loop_control:
+        label: "Processing {{ item.username }}"
+      when:
+        - all_perms | from_yaml | unique | intersect(target_galaxy_permissions) | length > 0
+
+    - name: Display summary
+      ansible.builtin.debug:
+        msg:
+          - "========================================================"
+          - "Users with Galaxy Permissions Summary"
+          - "========================================================"
+          - "Total users found with galaxy permissions: {{ users_with_galaxy_perms | default([]) | length }}"
+          - "========================================================"
+
+    - name: Display detailed user information
+      ansible.builtin.debug:
+        msg:
+          - "--------------------------------------------------------"
+          - "USER: {{ item.username }} (ID: {{ item.user_id }})"
+          - "EMAIL: {{ item.email }}"
+          - "GALAXY PERMISSIONS:"
+          - "{{ item.galaxy_permissions | to_nice_yaml(indent=2) }}"
+          - "ROLES:"
+          - "{{ item.role_assignments | from_yaml | to_nice_yaml(indent=2) }}"
+          - "--------------------------------------------------------"
+      loop: "{{ users_with_galaxy_perms | default([]) }}"
+      loop_control:
+        label: "{{ item.username }}"
+
+    - name: Generate CSV-friendly output
+      ansible.builtin.debug:
+        msg: "{{ item.username }},{{ item.user_id }},{{ item.email }},{{ item.galaxy_permissions | join(';') }}"
+      loop: "{{ users_with_galaxy_perms | default([]) }}"
+      loop_control:
+        label: "{{ item.username }}"
+      when: users_with_galaxy_perms | default([]) | length > 0
+
+    - name: Save results to file (optional)
+      ansible.builtin.copy:
+        content: |
+          # Users with Galaxy Permissions Report
+          # Generated: {{ ansible_date_time.iso8601 }}
+
+          {% for user in users_with_galaxy_perms | default([]) %}
+          ## {{ user.username }} ({{ user.email }})
+          - **User ID**: {{ user.user_id }}
+          - **Galaxy Permissions**:
+          {% for perm in user.galaxy_permissions %}
+            - {{ perm }}
+          {% endfor %}
+          - **Roles**:
+          {% for role in user.role_assignments | from_yaml %}
+            - {{ role }}
+          {% endfor %}
+
+          {% endfor %}
+        dest: "/tmp/galaxy_users_report_{{ ansible_date_time.date }}.md"
+      delegate_to: localhost
+      when: users_with_galaxy_perms | default([]) | length > 0
+
+    - name: Display report location
+      ansible.builtin.debug:
+        msg: "Report saved to: /tmp/galaxy_users_report_{{ ansible_date_time.date }}.md"
+      when: users_with_galaxy_perms | default([]) | length > 0
