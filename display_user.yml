@@ -2,7 +2,7 @@
 - name: List users with specific galaxy permissions
   hosts: localhost
   connection: local
-  gather_facts: false
+  gather_facts: true
 
   vars:
     aap_hostname: "{{ lookup('env', 'CONTROLLER_HOST') }}"
